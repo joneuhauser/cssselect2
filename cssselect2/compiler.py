@@ -44,7 +44,7 @@ class CompiledSelector:
             'ascii_lower': ascii_lower,
             'urlparse': urlparse,
         }
-        self.test = eval('lambda el: ' + source, eval_globals, {})
+        self.test = lambda el: source(el, **eval_globals)
         self.specificity = parsed_selector.specificity
         self.pseudo_element = parsed_selector.pseudo_element
         self.id = None
@@ -71,6 +71,10 @@ class CompiledSelector:
                 if simple_selector.name == 'lang':
                     self.requires_lang_attr = True
 
+def FALSE(el, **kwargs):
+    return 0
+def TRUE(el, **kwargs):
+    return 0
 
 def _compile_node(selector):
     """Return a boolean expression, as a Python source string.
@@ -88,54 +92,60 @@ def _compile_node(selector):
 
     if isinstance(selector, parser.CombinedSelector):
         left_inside = _compile_node(selector.left)
-        if left_inside == '0':
-            return '0'  # 0 and x == 0
-        elif left_inside == '1':
+        if left_inside == FALSE:
+            return FALSE  # 0 and x == 0
+        elif left_inside == TRUE:
             # 1 and x == x, but the element matching 1 still needs to exist.
             if selector.combinator in (' ', '>'):
-                left = 'el.parent is not None'
+                left = lambda el, **k: el.parent is not None
             elif selector.combinator in ('~', '+'):
-                left = 'el.previous is not None'
+                left = lambda el, **k: el.previous is not None
             else:
                 raise SelectorError('Unknown combinator', selector.combinator)
         # Rebind the `el` name inside a generator-expressions (in a new scope)
         # so that 'left_inside' applies to different elements.
         elif selector.combinator == ' ':
-            left = f'any(({left_inside}) for el in el.ancestors)'
+            left = lambda el, **k: any((left_inside(e, **k)) for e in el.ancestors)
         elif selector.combinator == '>':
-            left = (
-                f'next(el is not None and ({left_inside}) '
-                'for el in [el.parent])')
+            left = lambda el, **k: el.parent is not None and left_inside(el.parent, **k)
         elif selector.combinator == '+':
-            left = (
-                f'next(el is not None and ({left_inside}) '
-                'for el in [el.previous])')
+            left = lambda el, **k: el.previous is not None and left_inside(el.previous, **k)
         elif selector.combinator == '~':
-            left = f'any(({left_inside}) for el in el.previous_siblings)'
+            left = lambda el, **k: any((left_inside(e, **k)) for e in el.previous_siblings)
         else:
             raise SelectorError('Unknown combinator', selector.combinator)
 
         right = _compile_node(selector.right)
-        if right == '0':
-            return '0'  # 0 and x == 0
-        elif right == '1':
-            return left  # 1 and x == x
+        if right == FALSE:
+            return FALSE  # 0 and x == 0
+        elif right == TRUE:
+            return TRUE  # 1 and x == x
         else:
             # Evaluate combinators right to left
-            return f'({right}) and ({left})'
+            return lambda el, **k: right(el, **k) and left(el, **k)
 
     elif isinstance(selector, parser.CompoundSelector):
         sub_expressions = [
             expr for expr in map(_compile_node, selector.simple_selectors)
-            if expr != '1']
+            if expr != TRUE]
         if len(sub_expressions) == 1:
             test = sub_expressions[0]
-        elif '0' in sub_expressions:
-            test = '0'
+        elif FALSE in sub_expressions:
+            test = FALSE
         elif sub_expressions:
-            test = ' and '.join(f'({e})' for e in sub_expressions)
+            # def test(el, **k):
+            #     allres = True
+            #     for i, expr in enumerate(sub_expressions):
+            #         result = expr(el, **k)
+            #         if result == False:
+            #             return False
+            #         #print(f"Expression {i} on element {el.id} returned {result}")
+            #         allres = allres and result
+            #     return allres
+            # return test
+            test = lambda e, **k: all(expr(e, **k) for expr in sub_expressions)
         else:
-            test = '1'  # all([]) == True
+            test = TRUE  # all([]) == True
         return test
 
     elif isinstance(selector, parser.NegationSelector):
@@ -143,27 +153,35 @@ def _compile_node(selector):
             expr for expr in [
                 _compile_node(selector.parsed_tree)
                 for selector in selector.selector_list]
-            if expr != '1']
+            if expr != TRUE]
         if not sub_expressions:
-            return '0'
-        return f'not ({" or ".join(f"({expr})" for expr in sub_expressions)})'
+            return FALSE
+        return lambda el, **k: not any(expr(el, **k) for expr in sub_expressions)
 
     elif isinstance(selector, parser.RelationalSelector):
         sub_expressions = []
         for relative_selector in selector.selector_list:
             expression = _compile_node(relative_selector.selector.parsed_tree)
-            if expression == '0':
+            if expression == FALSE:
                 continue
+
             if relative_selector.combinator == ' ':
-                elements = 'list(el.iter_subtree())[1:]'
+                def check(el):
+                    subels = el.iter_subtree()
+                    next(subels)
+                    return any(expression(e) for e in subels)
+                sub_expressions.append(check)
             elif relative_selector.combinator == '>':
-                elements = 'el.iter_children()'
+                sub_expressions.append(lambda el: any(expression(e) for e in el.iter_children()))
             elif relative_selector.combinator == '+':
-                elements = 'list(el.iter_next_siblings())[:1]'
+                def check(el):
+                    subels = el.iter_next_siblings()
+                    next(subels)
+                    return any(expression(e) for e in subels)
+                sub_expressions.append(check)
             elif relative_selector.combinator == '~':
-                elements = 'el.iter_next_siblings()'
-            sub_expressions.append(f'(any({expression} for el in {elements}))')
-        return ' or '.join(sub_expressions)
+                sub_expressions.append(lambda el: any(expression(e) for e in el.iter_next_siblings()))
+        return lambda el, **k: any(expr(el) for expr in sub_expressions) 
 
     elif isinstance(selector, (
             parser.MatchesAnySelector, parser.SpecificityAdjustmentSelector)):
@@ -171,73 +189,63 @@ def _compile_node(selector):
             expr for expr in [
                 _compile_node(selector.parsed_tree)
                 for selector in selector.selector_list]
-            if expr != '0']
+            if expr != FALSE]
         if not sub_expressions:
-            return '0'
-        return ' or '.join(f'({expr})' for expr in sub_expressions)
+            return FALSE
+        return lambda el, **k: any(expr(el, **k) for expr in sub_expressions)
 
     elif isinstance(selector, parser.LocalNameSelector):
         if selector.lower_local_name == selector.local_name:
-            return f'el.local_name == {selector.local_name!r}'
+            return lambda el, **k: el.local_name == selector.local_name
         else:
-            return (
-                f'el.local_name == ({selector.lower_local_name!r} '
-                f'if el.in_html_document else {selector.local_name!r})')
+            return lambda el, **k: el.local_name == (selector.lower_local_name if el.in_html_document else selector.local_name)
 
     elif isinstance(selector, parser.NamespaceSelector):
-        return f'el.namespace_url == {selector.namespace!r}'
+        return lambda el, **k: el.namespace_url == selector.namespace
 
     elif isinstance(selector, parser.ClassSelector):
-        return f'{selector.class_name!r} in el.classes'
+        return lambda el, **k: selector.class_name in el.classes
 
     elif isinstance(selector, parser.IDSelector):
-        return f'el.id == {selector.ident!r}'
+        return lambda el, **k: el.id == selector.ident
 
     elif isinstance(selector, parser.AttributeSelector):
         if selector.namespace is not None:
             if selector.namespace:
                 if selector.name == selector.lower_name:
-                    key = repr(f'{{{selector.namespace}}}{selector.name}')
+                    key_func = lambda el: f'{{{selector.namespace}}}{selector.name}'
                 else:
                     lower = f'{{{selector.namespace}}}{selector.lower_name}'
                     name = f'{{{selector.namespace}}}{selector.name}'
-                    key = f'({lower!r} if el.in_html_document else {name!r})'
+                    key_func = lambda el: (lower if el.in_html_document else name)
             else:
                 if selector.name == selector.lower_name:
-                    key = repr(selector.name)
+                    key_func = lambda el: selector.name
                 else:
                     lower, name = selector.lower_name, selector.name
-                    key = f'({lower!r} if el.in_html_document else {name!r})'
+                    key_func = lambda el: lower if el.in_html_document else name
             value = selector.value
-            attribute_value = f'el.etree_element.get({key}, "")'
+            attribute_value = lambda el: el.etree_element.get(key_func(el), "")
             if selector.case_sensitive is False:
                 value = value.lower()
-                attribute_value += '.lower()'
+                attribute_value = lambda el: el.etree_element.get(key_func(el), "").lower()
             if selector.operator is None:
-                return f'{key} in el.etree_element.attrib'
+                return lambda el, **k: key_func(el) in el.etree_element.attrib
             elif selector.operator == '=':
-                return (
-                    f'{key} in el.etree_element.attrib and '
-                    f'{attribute_value} == {value!r}')
+                return lambda el, **k: key_func(el) in el.etree_element.attrib and attribute_value(el) == value
             elif selector.operator == '~=':
-                return (
-                    '0' if len(value.split()) != 1 or value.strip() != value
-                    else f'{value!r} in split_whitespace({attribute_value})')
+                return (FALSE if len(value.split()) != 1 or value.strip() != value else lambda el, **k: value in split_whitespace(attribute_value(el)))
             elif selector.operator == '|=':
-                return (
-                    f'{key} in el.etree_element.attrib and '
-                    f'{attribute_value} == {value!r} or '
-                    f'{attribute_value}.startswith({(value + "-")!r})')
+                return lambda el, **k: key_func(el) in el.etree_element.attrib and (attribute_value(el) == value or attribute_value(el).startswith(value + "-") )
             elif selector.operator == '^=':
                 if value:
-                    return f'{attribute_value}.startswith({value!r})'
+                    return lambda el, **k:  attribute_value(el).startswith(value)
                 else:
-                    return '0'
+                    return FALSE
             elif selector.operator == '$=':
-                return (
-                    f'{attribute_value}.endswith({value!r})' if value else '0')
+                return (lambda el, **k:  attribute_value(el).endswith(value)) if value else FALSE
             elif selector.operator == '*=':
-                return f'{value!r} in {attribute_value}' if value else '0'
+                return (lambda el, **k:  value in attribute_value(el)) if value else FALSE
             else:
                 raise SelectorError(
                     'Unknown attribute operator', selector.operator)
@@ -246,37 +254,26 @@ def _compile_node(selector):
 
     elif isinstance(selector, parser.PseudoClassSelector):
         if selector.name in ('link', 'any-link', 'local-link'):
-            test = html_tag_eq('a', 'area', 'link')
-            test += ' and el.etree_element.get("href") is not None '
+            test = lambda el, **k: html_tag_eq(el, 'a', 'area', 'link') and el.etree_element.get("href") is not None
             if selector.name == 'local-link':
-                test += 'and not urlparse(el.etree_element.get("href")).scheme'
+                return lambda el, **k: test(el, **k) and not urlparse(el.etree_element.get("href")).scheme
             return test
         elif selector.name == 'enabled':
-            input = html_tag_eq(
-                'button', 'input', 'select', 'textarea', 'option')
-            group = html_tag_eq('optgroup', 'menuitem', 'fieldset')
-            a = html_tag_eq('a', 'area', 'link')
-            return (
-                f'({input} and el.etree_element.get("disabled") is None'
-                '  and not el.in_disabled_fieldset) or'
-                f'({group} and el.etree_element.get("disabled") is None) or '
-                f'({a} and el.etree_element.get("href") is not None)')
+            return lambda el, **k: ((html_tag_eq(el, 'button', 'input', 'select', 'textarea', 'option') 
+                                    and el.etree_element.get("disabled") is None
+                                    and not el.in_disabled_fieldset) or
+                                    (html_tag_eq(el, 'optgroup', 'menuitem', 'fieldset') 
+                                     and el.etree_element.get("disabled") is None) or html_tag_eq(el, 'a', 'area', 'link') and el.etree_element.get("href") is not None)
         elif selector.name == 'disabled':
-            input = html_tag_eq(
-                'button', 'input', 'select', 'textarea', 'option')
-            group = html_tag_eq('optgroup', 'menuitem', 'fieldset')
-            return (
-                f'({input} and (el.etree_element.get("disabled") is not None'
-                '  or el.in_disabled_fieldset)) or'
-                f'({group} and el.etree_element.get("disabled") is not None)')
+            return lambda el, **k: ((html_tag_eq(el, 'button', 'input', 'select', 'textarea', 'option') and (el.etree_element.get("disabled") is not None
+                  or el.in_disabled_fieldset)) or
+                (html_tag_eq(el, 'optgroup', 'menuitem', 'fieldset') and el.etree_element.get("disabled") is not None))
         elif selector.name == 'checked':
-            input = html_tag_eq('input', 'menuitem')
-            option = html_tag_eq('option')
-            return (
-                f'({input} and el.etree_element.get("checked") is not None and'
-                '  ascii_lower(el.etree_element.get("type", "")) '
-                '  in ("checkbox", "radio")) or ('
-                f'{option} and el.etree_element.get("selected") is not None)')
+            return lambda el, **k: (
+                (html_tag_eq(el, 'input', 'menuitem') and el.etree_element.get("checked") is not None and
+                  ascii_lower(el.etree_element.get("type", "")) 
+                  in ("checkbox", "radio")) or (
+                html_tag_eq(el, 'option') and el.etree_element.get("selected") is not None))
         elif selector.name in (
                 'visited', 'hover', 'active', 'focus', 'focus-within',
                 'focus-visible', 'target', 'target-within', 'current', 'past',
@@ -284,29 +281,23 @@ def _compile_node(selector):
                 'stalled', 'muted', 'volume-locked', 'user-valid',
                 'user-invalid'):
             # Not applicable in a static context: never match.
-            return '0'
+            return FALSE
         elif selector.name in ('root', 'scope'):
-            return 'el.parent is None'
+            return lambda el, **k: el.parent is None
         elif selector.name == 'first-child':
-            return 'el.index == 0'
+            return lambda el, **k: el.index == 0
         elif selector.name == 'last-child':
-            return 'el.index + 1 == len(el.etree_siblings)'
+            return lambda el, **k: el.index + 1 == len(el.etree_siblings)
         elif selector.name == 'first-of-type':
-            return (
-                'all(s.tag != el.etree_element.tag'
-                '    for s in el.etree_siblings[:el.index])')
+            return lambda el, **k: all(s.tag != el.etree_element.tag for s in el.etree_siblings[:el.index])
         elif selector.name == 'last-of-type':
-            return (
-                'all(s.tag != el.etree_element.tag'
-                '    for s in el.etree_siblings[el.index + 1:])')
+            return lambda el, **k: all(s.tag != el.etree_element.tag for s in el.etree_siblings[el.index + 1:])
         elif selector.name == 'only-child':
-            return 'len(el.etree_siblings) == 1'
+            return lambda el, **k: len(el.etree_siblings) == 1
         elif selector.name == 'only-of-type':
-            return (
-                'all(s.tag != el.etree_element.tag or i == el.index'
-                '    for i, s in enumerate(el.etree_siblings))')
+            return lambda el, **k: all(s.tag != el.etree_element.tag or i == el.index for i, s in enumerate(el.etree_siblings))
         elif selector.name == 'empty':
-            return 'not (el.etree_children or el.etree_element.text)'
+            return lambda el, **k: not (el.etree_children or el.etree_element.text)
         else:
             raise SelectorError('Unknown pseudo-class', selector.name)
 
@@ -343,49 +334,42 @@ def _compile_node(selector):
                 current_list.append(argument)
 
             if selector_list:
-                test = ' and '.join(
-                    _compile_node(selector.parsed_tree)
+                compiled = (_compile_node(selector.parsed_tree)
                     for selector in parser.parse(selector_list))
+                test = lambda el: all(expr(el) for expr in compiled)
                 if selector.name == 'nth-child':
-                    count = (
-                        f'sum(1 for el in el.previous_siblings if ({test}))')
+                    count_func = lambda el: sum(1 for e in el.previous_siblings if test(e)) 
                 elif selector.name == 'nth-last-child':
-                    count = (
-                        'sum(1 for el in'
-                        '    tuple(el.iter_siblings())[el.index + 1:]'
-                        f'   if ({test}))')
+                    count_func = lambda el: sum(1 for e in tuple(el.iter_siblings())[el.index + 1:] if test(e)) 
                 elif selector.name == 'nth-of-type':
-                    count = (
-                        'sum(1 for s in ('
-                        '      el for el in el.previous_siblings'
-                        f'     if ({test}))'
-                        '    if s.etree_element.tag == el.etree_element.tag)')
+                    count_func = lambda el: (
+                        sum(1 for s in (
+                              e for e in el.previous_siblings
+                             if test(e))
+                            if s.etree_element.tag == el.etree_element.tag))
                 elif selector.name == 'nth-last-of-type':
-                    count = (
-                        'sum(1 for s in ('
-                        '      el for el in'
-                        '      tuple(el.iter_siblings())[el.index + 1:]'
-                        f'     if ({test}))'
-                        '    if s.etree_element.tag == el.etree_element.tag)')
+                    count_func = lambda el: (
+                        sum(1 for s in (
+                              e for e in
+                              tuple(el.iter_siblings())[el.index + 1:]
+                             if test(e))
+                            if s.etree_element.tag == el.etree_element.tag))
                 else:
                     raise SelectorError('Unknown pseudo-class', selector.name)
-                count += f'if ({test}) else float("nan")'
+                first_count_func = count_func
+                count_func = lambda el: first_count_func(el) if test(el) else float("nan")
             else:
                 if current_list is selector_list:
                     raise SelectorError(
                         f'Invalid arguments for :{selector.name}()')
                 if selector.name == 'nth-child':
-                    count = 'el.index'
+                    count_func = lambda el: el.index
                 elif selector.name == 'nth-last-child':
-                    count = 'len(el.etree_siblings) - el.index - 1'
+                    count_func = lambda el: len(el.etree_siblings) - el.index - 1
                 elif selector.name == 'nth-of-type':
-                    count = (
-                        'sum(1 for s in el.etree_siblings[:el.index]'
-                        '    if s.tag == el.etree_element.tag)')
+                    count_func = lambda el: sum(1 for s in el.etree_siblings[:el.index] if s.tag == el.etree_element.tag)
                 elif selector.name == 'nth-last-of-type':
-                    count = (
-                        'sum(1 for s in el.etree_siblings[el.index + 1:]'
-                        '    if s.tag == el.etree_element.tag)')
+                    count_func = lambda el: sum(1 for s in el.etree_siblings[el.index + 1:] if s.tag == el.etree_element.tag)
                 else:
                     raise SelectorError('Unknown pseudo-class', selector.name)
 
@@ -401,28 +385,20 @@ def _compile_node(selector):
             B = b - 1
             if a == 0:
                 # x = B
-                return f'({count}) == {B}'
+                return lambda el, **k: count_func(el) == B
             else:
                 # n = (x - B) / a
-                return (
-                    'next(r == 0 and n >= 0'
-                    f'    for n, r in [divmod(({count}) - {B}, {a})])')
+                return lambda el, **k: next(r == 0 and n >= 0  for n, r in [divmod(count_func(el) - B, a)])
 
     else:
         raise TypeError(type(selector), selector)
 
 
-def html_tag_eq(*local_names):
+def html_tag_eq(el, *local_names):
     """Generate expression testing equality with HTML local names."""
     if len(local_names) == 1:
         tag = '{http://www.w3.org/1999/xhtml}' + local_names[0]
-        return (
-            f'((el.local_name == {local_names[0]!r}) if el.in_html_document '
-            f'else (el.etree_element.tag == {tag!r}))')
+        return lambda el: (el.local_name == local_names[0]) if el.in_html_document else (el.etree_element.tag == tag)
     else:
-        names = ', '.join(repr(n) for n in local_names)
-        tags = ', '.join(
-            repr('{http://www.w3.org/1999/xhtml}' + n) for n in local_names)
-        return (
-            f'((el.local_name in ({names})) if el.in_html_document '
-            f'else (el.etree_element.tag in ({tags})))')
+        tags = ('{http://www.w3.org/1999/xhtml}' + n for n in local_names)
+        return lambda el: (el.local_name in local_names) if el.in_html_document else (el.etree_element.tag in tags)
